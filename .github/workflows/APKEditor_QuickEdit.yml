@@ -74,12 +74,41 @@ jobs:
           echo "Downloading APKEditor from $APKEDITOR_URL..."
           curl -L -s "$APKEDITOR_URL" -o "$RUNNER_TEMP/APKEditor.jar"
 
-      - name: Download Target APK
+      - name: Download & Validate Target APK
         env:
           APK_URL: ${{ inputs.apk_url }}
         run: |
-          echo "Downloading APK..."
-          curl -L --fail -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$APK_URL" -o original.apk
+          sudo apt-get update && sudo apt-get install -y aria2 zip file
+
+          echo "Downloading APK from URL..."
+          # Use aria2c to handle redirects, resume support, and content-disposition headers
+          aria2c --check-certificate=false \
+            --max-connection-per-server=4 \
+            --split=4 \
+            --min-split-size=1M \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" \
+            --allow-overwrite=true \
+            -d . -o original.apk "$APK_URL"
+
+          # Print file size and MIME type for debugging in Actions log
+          ls -lh original.apk
+          FILE_TYPE=$(file -b --mime-type original.apk)
+          echo "Detected MIME type: $FILE_TYPE"
+
+          # Fail early with a clear message if the URL returned an HTML webpage
+          if [[ "$FILE_TYPE" == "text/html" ]] || [[ "$FILE_TYPE" == "text/plain" ]]; then
+            echo "ERROR: The URL downloaded a text/HTML page instead of a binary APK!"
+            echo "First 20 lines of downloaded file:"
+            head -n 20 original.apk
+            exit 1
+          fi
+
+          # Check if standard ZIP End Record is missing/tampered, and repair it if needed
+          if ! unzip -tq original.apk >/dev/null 2>&1; then
+            echo "Warning: ZIP End Record missing or tampered. Rebuilding ZIP central directory..."
+            zip -FF original.apk --out fixed.apk -q
+            mv fixed.apk original.apk
+          fi
 
       - name: Decode APK with APKEditor
         run: |
