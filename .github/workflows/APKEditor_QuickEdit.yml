@@ -1,0 +1,317 @@
+name: APKEditor Quick Edit
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct Download URL of the APK (Required)'
+        required: true
+        type: string
+      app_name:
+        description: 'New App Name (leave blank to keep original)'
+        required: false
+        default: ''
+        type: string
+      package_name:
+        description: 'New Package Name, e.g., com.example.app (leave blank to keep)'
+        required: false
+        default: ''
+        type: string
+      icon_url:
+        description: 'Direct URL to New App Icon Image (leave blank to keep)'
+        required: false
+        default: ''
+        type: string
+      version_info:
+        description: 'Version Code & Name in format "code:name", e.g., "100:1.2.0" or ":1.2.0" or "100:"'
+        required: false
+        default: ''
+        type: string
+      sdk_versions:
+        description: 'Min & Target SDK in format "min:target", e.g., "21:34" or "24:" or ":34"'
+        required: false
+        default: ''
+        type: string
+      debuggable:
+        description: 'Set APK as debuggable (android:debuggable="true")'
+        required: false
+        default: false
+        type: boolean
+      delete_paths:
+        description: 'Paths to delete inside APK (space/comma separated, supports * wildcards, e.g., assets/assets/resource_packs/vanilla_music* lib/x86*)'
+        required: false
+        default: ''
+        type: string
+      remove_permissions:
+        description: 'Permissions to remove (comma/space separated, e.g., android.permission.INTERNET, android.permission.ACCESS_NETWORK_STATE)'
+        required: false
+        default: ''
+        type: string
+      signing_schemes:
+        description: 'Signing schemes to enable (comma-separated: v1,v2,v3,v4)'
+        required: false
+        default: 'v1,v2,v3'
+        type: string
+
+jobs:
+  patch-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Dependencies & Download APKEditor
+        run: |
+          sudo apt-get update && sudo apt-get install -y xmlstarlet imagemagick
+          APKEDITOR_URL=$(curl -s https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '.assets[] | select(.name | endswith(".jar")) | .browser_download_url' | head -n 1)
+          echo "Downloading APKEditor from $APKEDITOR_URL..."
+          curl -L -s "$APKEDITOR_URL" -o "$RUNNER_TEMP/APKEditor.jar"
+
+      - name: Download Target APK
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          echo "Downloading APK..."
+          curl -L --fail -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$APK_URL" -o original.apk
+
+      - name: Decode APK with APKEditor
+        run: |
+          # Decode to XML, keeping raw .dex files (-dex) for maximum speed
+          java -jar "$RUNNER_TEMP/APKEditor.jar" d -t xml -dex -i original.apk -o decompiled_apk
+
+      - name: Patch Manifest (Package, Version, SDKs, Debuggable, App Name, Permissions)
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PKG_NAME: ${{ inputs.package_name }}
+          VERSION_INFO: ${{ inputs.version_info }}
+          SDK_VERSIONS: ${{ inputs.sdk_versions }}
+          DEBUGGABLE: ${{ inputs.debuggable }}
+          REMOVE_PERMS: ${{ inputs.remove_permissions }}
+        run: |
+          MANIFEST="decompiled_apk/AndroidManifest.xml"
+
+          # Helper function to upsert XML attributes via xmlstarlet
+          upsert_attr() {
+            local xpath="$1"
+            local attr="$2"
+            local val="$3"
+            if xmlstarlet sel -t -v "${xpath}/@${attr}" "$MANIFEST" >/dev/null 2>&1; then
+              xmlstarlet ed -L -u "${xpath}/@${attr}" -v "$val" "$MANIFEST"
+            else
+              xmlstarlet ed -L -i "$xpath" -t attr -n "$attr" -v "$val" "$MANIFEST"
+            fi
+          }
+
+          # 1. Package Name Editing
+          if [ -n "$PKG_NAME" ]; then
+            OLD_PKG=$(xmlstarlet sel -t -v "/manifest/@package" "$MANIFEST")
+            echo "Changing package name from $OLD_PKG to $PKG_NAME..."
+            upsert_attr "/manifest" "package" "$PKG_NAME"
+            # Expand relative component names (starting with '.') to absolute names so activities don't break
+            for tag in activity activity-alias service receiver provider; do
+              xmlstarlet ed -L -u "//${tag}[starts-with(@android:name, '.')]/@android:name" \
+                -x "concat('${OLD_PKG}', .)" "$MANIFEST" 2>/dev/null || true
+            done
+            # Avoid provider authority conflicts on install
+            xmlstarlet ed -L -u "//provider/@android:authorities" \
+              -x "translate(., '${OLD_PKG}', '${PKG_NAME}')" "$MANIFEST" 2>/dev/null || true
+          fi
+
+          # 2. Version Code & Version Name Editing
+          if [ -n "$VERSION_INFO" ]; then
+            VER_CODE="${VERSION_INFO%%:*}"
+            VER_NAME="${VERSION_INFO#*:}"
+            if [ "$VER_CODE" = "$VERSION_INFO" ]; then VER_NAME=""; fi
+
+            if [ -n "$VER_CODE" ]; then
+              echo "Setting versionCode to $VER_CODE..."
+              upsert_attr "/manifest" "android:versionCode" "$VER_CODE"
+            fi
+            if [ -n "$VER_NAME" ]; then
+              echo "Setting versionName to $VER_NAME..."
+              upsert_attr "/manifest" "android:versionName" "$VER_NAME"
+            fi
+          fi
+
+          # 3. Min & Target SDK Editing
+          if [ -n "$SDK_VERSIONS" ]; then
+            if ! xmlstarlet sel -t -v "/manifest/uses-sdk" "$MANIFEST" >/dev/null 2>&1; then
+              xmlstarlet ed -L -s "/manifest" -t elem -n "uses-sdk" "$MANIFEST"
+            fi
+            MIN_SDK="${SDK_VERSIONS%%:*}"
+            TARGET_SDK="${SDK_VERSIONS#*:}"
+            if [ "$MIN_SDK" = "$SDK_VERSIONS" ]; then TARGET_SDK=""; fi
+
+            if [ -n "$MIN_SDK" ]; then
+              echo "Setting minSdkVersion to $MIN_SDK..."
+              upsert_attr "/manifest/uses-sdk" "android:minSdkVersion" "$MIN_SDK"
+            fi
+            if [ -n "$TARGET_SDK" ]; then
+              echo "Setting targetSdkVersion to $TARGET_SDK..."
+              upsert_attr "/manifest/uses-sdk" "android:targetSdkVersion" "$TARGET_SDK"
+            fi
+          fi
+
+          # 4. Set APK as Debuggable
+          if [ "$DEBUGGABLE" = "true" ]; then
+            echo "Setting android:debuggable=true..."
+            upsert_attr "/manifest/application" "android:debuggable" "true"
+          fi
+
+          # 5. App Name Editing
+          if [ -n "$APP_NAME" ]; then
+            echo "Setting App Name to '$APP_NAME'..."
+            upsert_attr "/manifest/application" "android:label" "$APP_NAME"
+          fi
+
+          # 6. Permission Removal
+          if [ -n "$REMOVE_PERMS" ]; then
+            # Replace commas with spaces and iterate
+            for perm in $(echo "$REMOVE_PERMS" | tr ',' ' '); do
+              perm=$(echo "$perm" | xargs)
+              if [ -n "$perm" ]; then
+                echo "Removing permission: $perm"
+                xmlstarlet ed -L -d "/manifest/uses-permission[@android:name='${perm}']" "$MANIFEST"
+                xmlstarlet ed -L -d "/manifest/uses-permission-sdk-23[@android:name='${perm}']" "$MANIFEST"
+              fi
+            done
+          fi
+
+      - name: Replace Package Icon
+        if: ${{ inputs.icon_url != '' }}
+        env:
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          MANIFEST="decompiled_apk/AndroidManifest.xml"
+          echo "Downloading custom icon from $ICON_URL..."
+          curl -L --fail -A "Mozilla/5.0" "$ICON_URL" -o "$RUNNER_TEMP/raw_icon"
+
+          # Convert to standard 512x512 PNG to guarantee valid Android resource compilation
+          convert "$RUNNER_TEMP/raw_icon" -resize 512x512 PNG32:"$RUNNER_TEMP/custom_icon.png"
+
+          # Detect current icon attribute from <application>
+          ICON_REF=$(xmlstarlet sel -t -v "/manifest/application/@android:icon" "$MANIFEST" || true)
+
+          if [[ "$ICON_REF" == @*/* ]]; then
+            RES_TYPE=$(echo "$ICON_REF" | cut -d'/' -f1 | tr -d '@')
+            RES_NAME=$(echo "$ICON_REF" | cut -d'/' -f2)
+            echo "Detected existing icon resource: type=$RES_TYPE, name=$RES_NAME"
+
+            # Overwrite all matching raster icons (.png / .webp) across all density folders
+            FOUND_RASTER=0
+            while IFS= read -r -d '' file; do
+              echo "Replacing raster icon: $file"
+              if [[ "$file" == *.webp ]]; then
+                convert "$RUNNER_TEMP/custom_icon.png" "$file"
+              else
+                cp "$RUNNER_TEMP/custom_icon.png" "$file"
+              fi
+              FOUND_RASTER=1
+            done < <(find decompiled_apk/resources -type f \( -name "${RES_NAME}.png" -o -name "${RES_NAME}.webp" \) -print0)
+
+            # Remove adaptive XML icon definitions (e.g., mipmap-anydpi-v26/ic_launcher.xml) so Android uses our raster PNG
+            find decompiled_apk/resources -path "*/${RES_TYPE}*/*" -name "${RES_NAME}.xml" -exec echo "Removing adaptive XML override: {}" \; -exec rm -f {} +
+
+            # If the app ONLY had an XML vector/adaptive icon and no raster fallback, inject one into drawable/mipmap
+            if [ "$FOUND_RASTER" -eq 0 ]; then
+              TARGET_DIR=$(find decompiled_apk/resources -type d -name "${RES_TYPE}-xxhdpi*" -o -name "${RES_TYPE}-xhdpi*" -o -name "${RES_TYPE}" | head -n 1)
+              if [ -n "$TARGET_DIR" ]; then
+                cp "$RUNNER_TEMP/custom_icon.png" "$TARGET_DIR/${RES_NAME}.png"
+                echo "Injected new PNG icon into $TARGET_DIR/${RES_NAME}.png"
+              fi
+            fi
+          fi
+
+          # Remove roundIcon attribute so Android doesn't display the old round adaptive icon
+          xmlstarlet ed -L -d "/manifest/application/@android:roundIcon" "$MANIFEST" 2>/dev/null || true
+
+      - name: Delete User-Specified Paths (with Wildcard Support)
+        if: ${{ inputs.delete_paths != '' }}
+        env:
+          DELETE_PATHS: ${{ inputs.delete_paths }}
+        run: |
+          shopt -s globstar nullglob
+          cd decompiled_apk
+
+          # Normalize comma-separated or newline-separated entries into space-separated patterns
+          PATTERNS=$(echo "$DELETE_PATHS" | tr ',' ' ')
+
+          for pattern in $PATTERNS; do
+            # Strip leading slash or "file.apk/" prefix if user pasted full path
+            clean_pat="${pattern#/}"
+            clean_pat="${clean_pat#file.apk/}"
+
+            echo "Processing deletion pattern: $clean_pat"
+
+            # In APKEditor, raw archive files (assets/, lib/, META-INF/) live inside root/
+            # while res/ lives inside resources/. Check both root/$clean_pat and direct $clean_pat.
+            matched=0
+            for target in root/$clean_pat $clean_pat; do
+              if [ -e "$target" ]; then
+                echo "  Deleting: $target"
+                rm -rf "$target"
+                matched=1
+              fi
+            done
+
+            if [ "$matched" -eq 0 ]; then
+              echo "  Warning: No files or folders matched '$clean_pat'"
+            fi
+          done
+
+      - name: Rebuild and Zipalign APK
+        run: |
+          java -jar "$RUNNER_TEMP/APKEditor.jar" b -i decompiled_apk -o rebuilt.apk
+
+          BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          echo "BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
+
+          "$BUILD_TOOLS_DIR/zipalign" -p -f -v 4 rebuilt.apk aligned.apk
+
+      - name: Generate Debug Keystore & Sign APK
+        env:
+          SCHEMES: ${{ inputs.signing_schemes }}
+        run: |
+          keytool -genkey -v -keystore debug.keystore \
+            -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          mkdir -p output
+
+          # Parse v1, v2, v3, v4 from comma-separated string
+          V1="false"; V2="false"; V3="false"; V4="false"
+          if [[ "$SCHEMES" == *"v1"* ]]; then V1="true"; fi
+          if [[ "$SCHEMES" == *"v2"* ]]; then V2="true"; fi
+          if [[ "$SCHEMES" == *"v3"* ]]; then V3="true"; fi
+          if [[ "$SCHEMES" == *"v4"* ]]; then V4="true"; fi
+
+          echo "Signing with schemes -> v1:$V1, v2:$V2, v3:$V3, v4:$V4"
+
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --v1-signing-enabled "$V1" \
+            --v2-signing-enabled "$V2" \
+            --v3-signing-enabled "$V3" \
+            --v4-signing-enabled "$V4" \
+            --out output/signed.apk \
+            aligned.apk
+
+          "$BUILD_TOOLS_DIR/apksigner" verify -v output/signed.apk
+
+      - name: Upload Signed APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Modified-Signed-APK
+          path: output/*
+          retention-days: 90
