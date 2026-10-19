@@ -1,4 +1,4 @@
-name: APKEditor Quick Edit
+name: Modify and Sign APK (APKEditor Extended)
 
 on:
   workflow_dispatch:
@@ -43,7 +43,7 @@ on:
         default: ''
         type: string
       remove_permissions:
-        description: 'Permissions to remove (comma/space separated, e.g., android.permission.INTERNET, android.permission.ACCESS_NETWORK_STATE)'
+        description: 'Permissions to remove (comma/space separated, e.g., android.permission.INTERNET)'
         required: false
         default: ''
         type: string
@@ -62,14 +62,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Install Dependencies & Download APKEditor
         run: |
-          sudo apt-get update && sudo apt-get install -y xmlstarlet imagemagick
+          sudo apt-get update && sudo apt-get install -y xmlstarlet imagemagick aria2 p7zip-full zip file
           APKEDITOR_URL=$(curl -s https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '.assets[] | select(.name | endswith(".jar")) | .browser_download_url' | head -n 1)
           echo "Downloading APKEditor from $APKEDITOR_URL..."
           curl -L -s "$APKEDITOR_URL" -o "$RUNNER_TEMP/APKEditor.jar"
@@ -78,10 +78,7 @@ jobs:
         env:
           APK_URL: ${{ inputs.apk_url }}
         run: |
-          sudo apt-get update && sudo apt-get install -y aria2 zip file
-
           echo "Downloading APK from URL..."
-          # Use aria2c to handle redirects, resume support, and content-disposition headers
           aria2c --check-certificate=false \
             --max-connection-per-server=4 \
             --split=4 \
@@ -90,30 +87,49 @@ jobs:
             --allow-overwrite=true \
             -d . -o original.apk "$APK_URL"
 
-          # Print file size and MIME type for debugging in Actions log
           ls -lh original.apk
           FILE_TYPE=$(file -b --mime-type original.apk)
           echo "Detected MIME type: $FILE_TYPE"
 
-          # Fail early with a clear message if the URL returned an HTML webpage
           if [[ "$FILE_TYPE" == "text/html" ]] || [[ "$FILE_TYPE" == "text/plain" ]]; then
             echo "ERROR: The URL downloaded a text/HTML page instead of a binary APK!"
-            echo "First 20 lines of downloaded file:"
             head -n 20 original.apk
             exit 1
           fi
 
-          # Check if standard ZIP End Record is missing/tampered, and repair it if needed
-          if ! unzip -tq original.apk >/dev/null 2>&1; then
-            echo "Warning: ZIP End Record missing or tampered. Rebuilding ZIP central directory..."
-            zip -FF original.apk --out fixed.apk -q
-            mv fixed.apk original.apk
-          fi
-
       - name: Decode APK with APKEditor
         run: |
-          # Decode to XML, keeping raw .dex files (-dex) for maximum speed
-          java -jar "$RUNNER_TEMP/APKEditor.jar" d -t xml -dex -i original.apk -o decompiled_apk
+          # Attempt direct APKEditor decode first.
+          # If APKEditor fails with ArchiveException (e.g. ZIP64 EOCD or anti-tamper headers)
+          # or fails to extract AndroidManifest.xml, normalize the ZIP structure via 7z and retry.
+          if ! java -jar "$RUNNER_TEMP/APKEditor.jar" d -t xml -dex -i original.apk -o decompiled_apk || [ ! -f "decompiled_apk/AndroidManifest.xml" ]; then
+            echo "Direct APKEditor decode failed or missing AndroidManifest.xml. Normalizing APK ZIP structure with 7z..."
+            rm -rf decompiled_apk raw_extract
+            mkdir -p raw_extract
+
+            # 7z ignores tampered local ZIP headers and extracts cleanly
+            7z x -y original.apk -oraw_extract >/dev/null || true
+
+            if [ ! -f "raw_extract/AndroidManifest.xml" ]; then
+              echo "ERROR: AndroidManifest.xml not found even after 7z extraction! Listing top-level archive contents:"
+              ls -la raw_extract
+              exit 1
+            fi
+
+            # Repack into a clean standard ZIP (preserving uncompressed resources.arsc and .so alignment)
+            rm -f original.apk
+            (cd raw_extract && zip -q -r -0 ../original.apk resources.arsc lib 2>/dev/null || true)
+            (cd raw_extract && zip -q -r -1 ../original.apk . -x "resources.arsc" "lib/*" "META-INF/*")
+            rm -rf raw_extract
+
+            echo "Retrying APKEditor decode on normalized APK..."
+            java -jar "$RUNNER_TEMP/APKEditor.jar" d -t xml -dex -i original.apk -o decompiled_apk
+          fi
+
+          if [ ! -f "decompiled_apk/AndroidManifest.xml" ]; then
+            echo "ERROR: decompiled_apk/AndroidManifest.xml was not generated!"
+            exit 1
+          fi
 
       - name: Patch Manifest (Package, Version, SDKs, Debuggable, App Name, Permissions)
         env:
@@ -126,7 +142,7 @@ jobs:
         run: |
           MANIFEST="decompiled_apk/AndroidManifest.xml"
 
-          # Helper function to upsert XML attributes via xmlstarlet
+          # Use -s (subnode) to insert new attributes inside the target element
           upsert_attr() {
             local xpath="$1"
             local attr="$2"
@@ -134,7 +150,7 @@ jobs:
             if xmlstarlet sel -t -v "${xpath}/@${attr}" "$MANIFEST" >/dev/null 2>&1; then
               xmlstarlet ed -L -u "${xpath}/@${attr}" -v "$val" "$MANIFEST"
             else
-              xmlstarlet ed -L -i "$xpath" -t attr -n "$attr" -v "$val" "$MANIFEST"
+              xmlstarlet ed -L -s "$xpath" -t attr -n "$attr" -v "$val" "$MANIFEST"
             fi
           }
 
@@ -143,12 +159,10 @@ jobs:
             OLD_PKG=$(xmlstarlet sel -t -v "/manifest/@package" "$MANIFEST")
             echo "Changing package name from $OLD_PKG to $PKG_NAME..."
             upsert_attr "/manifest" "package" "$PKG_NAME"
-            # Expand relative component names (starting with '.') to absolute names so activities don't break
             for tag in activity activity-alias service receiver provider; do
               xmlstarlet ed -L -u "//${tag}[starts-with(@android:name, '.')]/@android:name" \
                 -x "concat('${OLD_PKG}', .)" "$MANIFEST" 2>/dev/null || true
             done
-            # Avoid provider authority conflicts on install
             xmlstarlet ed -L -u "//provider/@android:authorities" \
               -x "translate(., '${OLD_PKG}', '${PKG_NAME}')" "$MANIFEST" 2>/dev/null || true
           fi
@@ -171,7 +185,7 @@ jobs:
 
           # 3. Min & Target SDK Editing
           if [ -n "$SDK_VERSIONS" ]; then
-            if ! xmlstarlet sel -t -v "/manifest/uses-sdk" "$MANIFEST" >/dev/null 2>&1; then
+            if ! xmlstarlet sel -t -c "/manifest/uses-sdk" "$MANIFEST" | grep -q "uses-sdk"; then
               xmlstarlet ed -L -s "/manifest" -t elem -n "uses-sdk" "$MANIFEST"
             fi
             MIN_SDK="${SDK_VERSIONS%%:*}"
@@ -202,7 +216,6 @@ jobs:
 
           # 6. Permission Removal
           if [ -n "$REMOVE_PERMS" ]; then
-            # Replace commas with spaces and iterate
             for perm in $(echo "$REMOVE_PERMS" | tr ',' ' '); do
               perm=$(echo "$perm" | xargs)
               if [ -n "$perm" ]; then
@@ -222,10 +235,8 @@ jobs:
           echo "Downloading custom icon from $ICON_URL..."
           curl -L --fail -A "Mozilla/5.0" "$ICON_URL" -o "$RUNNER_TEMP/raw_icon"
 
-          # Convert to standard 512x512 PNG to guarantee valid Android resource compilation
           convert "$RUNNER_TEMP/raw_icon" -resize 512x512 PNG32:"$RUNNER_TEMP/custom_icon.png"
 
-          # Detect current icon attribute from <application>
           ICON_REF=$(xmlstarlet sel -t -v "/manifest/application/@android:icon" "$MANIFEST" || true)
 
           if [[ "$ICON_REF" == @*/* ]]; then
@@ -233,7 +244,6 @@ jobs:
             RES_NAME=$(echo "$ICON_REF" | cut -d'/' -f2)
             echo "Detected existing icon resource: type=$RES_TYPE, name=$RES_NAME"
 
-            # Overwrite all matching raster icons (.png / .webp) across all density folders
             FOUND_RASTER=0
             while IFS= read -r -d '' file; do
               echo "Replacing raster icon: $file"
@@ -245,10 +255,8 @@ jobs:
               FOUND_RASTER=1
             done < <(find decompiled_apk/resources -type f \( -name "${RES_NAME}.png" -o -name "${RES_NAME}.webp" \) -print0)
 
-            # Remove adaptive XML icon definitions (e.g., mipmap-anydpi-v26/ic_launcher.xml) so Android uses our raster PNG
             find decompiled_apk/resources -path "*/${RES_TYPE}*/*" -name "${RES_NAME}.xml" -exec echo "Removing adaptive XML override: {}" \; -exec rm -f {} +
 
-            # If the app ONLY had an XML vector/adaptive icon and no raster fallback, inject one into drawable/mipmap
             if [ "$FOUND_RASTER" -eq 0 ]; then
               TARGET_DIR=$(find decompiled_apk/resources -type d -name "${RES_TYPE}-xxhdpi*" -o -name "${RES_TYPE}-xhdpi*" -o -name "${RES_TYPE}" | head -n 1)
               if [ -n "$TARGET_DIR" ]; then
@@ -258,7 +266,6 @@ jobs:
             fi
           fi
 
-          # Remove roundIcon attribute so Android doesn't display the old round adaptive icon
           xmlstarlet ed -L -d "/manifest/application/@android:roundIcon" "$MANIFEST" 2>/dev/null || true
 
       - name: Delete User-Specified Paths (with Wildcard Support)
@@ -269,18 +276,14 @@ jobs:
           shopt -s globstar nullglob
           cd decompiled_apk
 
-          # Normalize comma-separated or newline-separated entries into space-separated patterns
           PATTERNS=$(echo "$DELETE_PATHS" | tr ',' ' ')
 
           for pattern in $PATTERNS; do
-            # Strip leading slash or "file.apk/" prefix if user pasted full path
             clean_pat="${pattern#/}"
             clean_pat="${clean_pat#file.apk/}"
 
             echo "Processing deletion pattern: $clean_pat"
 
-            # In APKEditor, raw archive files (assets/, lib/, META-INF/) live inside root/
-            # while res/ lives inside resources/. Check both root/$clean_pat and direct $clean_pat.
             matched=0
             for target in root/$clean_pat $clean_pat; do
               if [ -e "$target" ]; then
@@ -299,6 +302,12 @@ jobs:
         run: |
           java -jar "$RUNNER_TEMP/APKEditor.jar" b -i decompiled_apk -o rebuilt.apk
 
+          ls -lh rebuilt.apk
+          if ! unzip -l rebuilt.apk | grep -q "AndroidManifest.xml"; then
+            echo "ERROR: rebuilt.apk is missing AndroidManifest.xml!"
+            exit 1
+          fi
+
           BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
           echo "BUILD_TOOLS_DIR=$BUILD_TOOLS_DIR" >> "$GITHUB_ENV"
 
@@ -315,7 +324,6 @@ jobs:
 
           mkdir -p output
 
-          # Parse v1, v2, v3, v4 from comma-separated string
           V1="false"; V2="false"; V3="false"; V4="false"
           if [[ "$SCHEMES" == *"v1"* ]]; then V1="true"; fi
           if [[ "$SCHEMES" == *"v2"* ]]; then V2="true"; fi
